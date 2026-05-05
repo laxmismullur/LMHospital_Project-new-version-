@@ -1,0 +1,185 @@
+// LMHospital Jenkins CI/CD Pipeline
+// Stages: Checkout → Build → Test → Docker Build → Push → Deploy to EC2
+
+pipeline {
+    agent any
+
+    environment {
+        APP_NAME          = 'lm-hospital'
+        DOCKER_HUB_USER   = credentials('docker-hub-username')
+        DOCKER_HUB_CREDS  = credentials('docker-hub-credentials')
+        EC2_HOST          = credentials('ec2-host')
+        EC2_SSH_KEY       = credentials('ec2-ssh-key')
+        BACKEND_IMAGE     = "${DOCKER_HUB_USER}/${APP_NAME}-backend"
+        FRONTEND_IMAGE    = "${DOCKER_HUB_USER}/${APP_NAME}-frontend"
+        BUILD_TAG         = "${env.BUILD_NUMBER}-${env.GIT_COMMIT?.take(7) ?: 'latest'}"
+    }
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        timeout(time: 30, unit: 'MINUTES')
+        disableConcurrentBuilds()
+    }
+
+    stages {
+
+        // ── 1. Checkout ─────────────────────────────────────────
+        stage('Checkout') {
+            steps {
+                git branch: 'main',
+                    url: 'https://github.com/your-org/lm-hospital.git',
+                    credentialsId: 'github-credentials'
+                echo "Checked out branch: ${env.GIT_BRANCH}, commit: ${env.GIT_COMMIT?.take(7)}"
+            }
+        }
+
+        // ── 2. Backend Build & Test ─────────────────────────────
+        stage('Backend: Build & Test') {
+            steps {
+                dir('backend') {
+                    sh '''
+                        echo "==> Building Spring Boot backend..."
+                        mvn clean package -DskipTests=false \
+                            -Dspring.datasource.url=jdbc:h2:mem:testdb \
+                            -Dspring.datasource.driverClassName=org.h2.Driver \
+                            -Dspring.jpa.database-platform=org.hibernate.dialect.H2Dialect \
+                            -B --no-transfer-progress
+                    '''
+                }
+            }
+            post {
+                always {
+                    junit 'backend/target/surefire-reports/*.xml'
+                }
+            }
+        }
+
+        // ── 3. Frontend Build ───────────────────────────────────
+        stage('Frontend: Build') {
+            steps {
+                dir('frontend') {
+                    sh '''
+                        echo "==> Installing frontend dependencies..."
+                        npm ci
+                        echo "==> Building React app..."
+                        npm run build
+                    '''
+                }
+            }
+        }
+
+        // ── 4. Docker Build ─────────────────────────────────────
+        stage('Docker: Build Images') {
+            steps {
+                sh '''
+                    echo "==> Building Docker images with tag: ${BUILD_TAG}"
+                    docker build -t ${BACKEND_IMAGE}:${BUILD_TAG}  -t ${BACKEND_IMAGE}:latest  ./backend
+                    docker build -t ${FRONTEND_IMAGE}:${BUILD_TAG} -t ${FRONTEND_IMAGE}:latest ./frontend
+                '''
+            }
+        }
+
+        // ── 5. Docker Push ──────────────────────────────────────
+        stage('Docker: Push to Hub') {
+            steps {
+                withCredentials([usernamePassword(
+                    credentialsId: 'docker-hub-credentials',
+                    usernameVariable: 'DOCKER_USER',
+                    passwordVariable: 'DOCKER_PASS'
+                )]) {
+                    sh '''
+                        echo "==> Pushing images to Docker Hub..."
+                        echo $DOCKER_PASS | docker login -u $DOCKER_USER --password-stdin
+                        docker push ${BACKEND_IMAGE}:${BUILD_TAG}
+                        docker push ${BACKEND_IMAGE}:latest
+                        docker push ${FRONTEND_IMAGE}:${BUILD_TAG}
+                        docker push ${FRONTEND_IMAGE}:latest
+                        docker logout
+                    '''
+                }
+            }
+        }
+
+        // ── 6. Deploy to AWS EC2 ────────────────────────────────
+        stage('Deploy: AWS EC2') {
+            when {
+                branch 'main'
+            }
+            steps {
+                withCredentials([
+                    sshUserPrivateKey(credentialsId: 'ec2-ssh-key', keyFileVariable: 'SSH_KEY'),
+                    string(credentialsId: 'ec2-host', variable: 'HOST'),
+                    string(credentialsId: 'db-password', variable: 'DB_PASS'),
+                    string(credentialsId: 'jwt-secret', variable: 'JWT_SEC')
+                ]) {
+                    sh '''
+                        echo "==> Deploying to EC2: ${HOST}"
+                        ssh -o StrictHostKeyChecking=no -i ${SSH_KEY} ec2-user@${HOST} << REMOTE
+                            cd /opt/lm-hospital
+
+                            # Pull latest images
+                            docker pull ${BACKEND_IMAGE}:latest
+                            docker pull ${FRONTEND_IMAGE}:latest
+
+                            # Write env file
+                            cat > .env << ENV
+DB_USERNAME=lmuser
+DB_PASSWORD=${DB_PASS}
+JWT_SECRET=${JWT_SEC}
+GRAFANA_USER=lmadmin
+GRAFANA_PASSWORD=lmgrafana
+ENV
+
+                            # Rolling restart
+                            docker-compose up -d --no-build
+                            docker-compose ps
+
+                            echo "Deploy complete — build ${BUILD_TAG}"
+REMOTE
+                    '''
+                }
+            }
+        }
+
+        // ── 7. Health Check ─────────────────────────────────────
+        stage('Health Check') {
+            when {
+                branch 'main'
+            }
+            steps {
+                withCredentials([string(credentialsId: 'ec2-host', variable: 'HOST')]) {
+                    sh '''
+                        echo "==> Waiting for app to come up..."
+                        sleep 20
+                        STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://${HOST}/actuator/health)
+                        if [ "$STATUS" = "200" ]; then
+                            echo "Health check PASSED (HTTP ${STATUS})"
+                        else
+                            echo "Health check FAILED (HTTP ${STATUS})"
+                            exit 1
+                        fi
+                    '''
+                }
+            }
+        }
+    }
+
+    // ── Post actions ────────────────────────────────────────────
+    post {
+        success {
+            echo "Pipeline SUCCESS — Build ${BUILD_TAG} deployed."
+        }
+        failure {
+            echo "Pipeline FAILED — Check logs."
+            // emailext(
+            //     subject: "LMHospital Build FAILED: ${BUILD_TAG}",
+            //     body: "Build ${env.BUILD_URL} failed. Please investigate.",
+            //     to: 'devops@lmhospital.com'
+            // )
+        }
+        always {
+            sh 'docker image prune -f --filter "until=24h" || true'
+            cleanWs()
+        }
+    }
+}
